@@ -274,7 +274,7 @@ test('stored times stay true: a clock time today, a weekday this week, a date be
   assert.equal(formatWhen(older, now, 'since'), 'since Sep 10');
 });
 
-const CREDIT = 'workflow step "main" failed via harness: 402 Credit limit exceeded, please add credits.';
+const CREDIT = 'workflow step "main" failed via harness: 402 Credit limit exceeded, please [add credits](https://api.fixture-provider.test/settings/billing).';
 
 test('workflows stopped on one account cause are one item naming each of them, not one per run', () => {
   const obs: WorkObservation = { chats: [], drafts: [], runs: [
@@ -296,7 +296,8 @@ test('workflows stopped on one account cause are one item naming each of them, n
   assert.deepEqual(cause.refs, ['c3', 'c2']);
   assert.equal(cause.count, 2);
   assert.match(cause.detail, /^2 workflows stopped because an account they use is out of credit: Morning Briefing, Platform Review\./);
-  assert.match(cause.detail, /402 Credit limit exceeded/, 'the provider\'s own words');
+  assert.match(cause.detail, /Latest .+, refused by fixture-provider\.test\.$/, 'where the refusal came from');
+  assert.doesNotMatch(cause.detail, /402|via harness|step "main"|\]\(/, 'never the run\'s diagnostic text');
   assert.deepEqual(c.filter((x) => /^run_failed:c\d$/.test(x.key)), [], 'no card per run');
   assert.ok(c.some((x) => x.key === 'run_failed:x1'));
   assert.match(buildWorkReviewNotification(cause, iso(0), 'push').title, /^2 workflows stopped: An account is out of credit/);
@@ -330,24 +331,56 @@ test('a cause card follows what it stops: a newly stopped workflow replaces it q
   await tick('t3', NOW + 60 * 60_000);
   assert.equal(h.published.length, 2);
 
-  // One ran cleanly: the card stays for the other.
+  // One ran cleanly: the open card is corrected, quietly, for the other.
   runs = [...runs, { runId: 'a2', workflow: 'platform-review', status: 'completed', createdAt: iso(70 * 60_000), finishedAt: iso(75 * 60_000) }];
   await tick('t4', NOW + 80 * 60_000);
   assert.equal(h.state.items[key]!.retiredAt, undefined);
   assert.deepEqual(h.state.items[key]!.workflows, ['morning-briefing']);
+  assert.equal(h.published.length, 3);
+  assert.ok(h.markedRead.includes(h.published[1]!.id), 'the card naming both leaves');
+  assert.match(h.published[2]!.title, /^Morning Briefing stopped|^1 workflow|An account is out of credit/);
+  assert.doesNotMatch(h.published[2]!.body ?? '', /Platform Review/);
 
   // Both ran cleanly: the card leaves.
   runs = [...runs, { runId: 'b2', workflow: 'morning-briefing', status: 'completed', createdAt: iso(85 * 60_000), finishedAt: iso(90 * 60_000) }];
   await tick('t5', NOW + 2 * H);
   assert.ok(h.state.items[key]!.retiredAt);
-  assert.ok(h.markedRead.includes(h.published[1]!.id));
+  assert.ok(h.markedRead.includes(h.published[2]!.id));
 
   // The cause stops a workflow again: raised again.
   runs = [...runs, { runId: 'a3', workflow: 'platform-review', status: 'failed', createdAt: iso(150 * 60_000), finishedAt: iso(150 * 60_000), error: CREDIT }];
   const again = await tick('t6', NOW + 3 * H);
   assert.equal(again.produced, 1);
   assert.equal(h.state.items[key]!.retiredAt, undefined);
-  assert.equal(h.published.length, 3);
+  assert.equal(h.published.length, 4);
+});
+
+test('a deleted workflow is not named on a card, and a card the owner put away stays away when one leaves', async () => {
+  const runs: WorkObservation['runs'] = [
+    { runId: 'd1', workflow: 'platform-review', status: 'failed', createdAt: iso(-2 * H), finishedAt: iso(-2 * H), error: CREDIT },
+    { runId: 'd2', workflow: 'FRAMEWORK-TEST Fixture Watch', status: 'failed', createdAt: iso(-1 * H), finishedAt: iso(-1 * H), error: CREDIT },
+    { runId: 'd3', workflow: 'FRAMEWORK-TEST Gone Digest', status: 'failed', createdAt: iso(-1 * H), finishedAt: iso(-1 * H), error: 'IMAP login refused' },
+  ];
+  const now = new Set(['platform-review', 'Platform Review']);
+  const c = deriveWorkReviewCandidates({ chats: [], drafts: [], runs, workflowsNow: now }, DEFAULT_WORK_REVIEW_CONFIG, NOW, null);
+  assert.deepEqual(c.find((x) => x.key === 'run_failed:cause:out_of_credit')?.workflows, ['platform-review']);
+  assert.equal(c.some((x) => x.key === 'run_failed:d3'), false, 'nothing to look at or run again');
+  assert.equal(deriveWorkReviewCandidates({ chats: [], drafts: [], runs }, DEFAULT_WORK_REVIEW_CONFIG, NOW, null)
+    .find((x) => x.key === 'run_failed:cause:out_of_credit')?.count, 2, 'an unreadable list hides nothing');
+
+  // The owner put the card away; a workflow leaving updates it without bringing it back.
+  let workflowsNow: Set<string> | undefined;
+  const h = harness({ notify: 'push' });
+  const tick = (id: string, at: number, readIds?: Set<string>) => runWorkReviewTick({ ...h.deps, tickId: id, now: () => at,
+    isNotificationRead: (nid: string) => readIds?.has(nid) ?? false,
+    observe: async () => ({ observation: { chats: [], drafts: [], runs, ...(workflowsNow ? { workflowsNow } : {}) }, readFailures: 0 }) });
+  await tick('t1', NOW);
+  const card = h.published.find((n) => /An account is out of credit/.test(n.title))!;
+  assert.match(card.body ?? '', /FRAMEWORK-TEST Fixture Watch/);
+  workflowsNow = now;
+  await tick('t2', NOW + 30 * 60_000, new Set([card.id]));
+  assert.equal(h.published.filter((n) => /An account is out of credit/.test(n.title)).length, 1, 'no card comes back');
+  assert.deepEqual(h.state.items['run_failed:cause:out_of_credit']!.workflows, ['platform-review']);
 });
 
 test('a cause that stopped workflows before the review last looked keeps nothing new open', async () => {

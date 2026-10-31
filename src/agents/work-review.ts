@@ -55,6 +55,10 @@ export interface WorkObservation {
   runs: WorkRunObservation[];
   chats: ChatWaitObservation[];
   drafts: DraftObservation[];
+  /** The workflows the owner has now, by name and folder. A run of one
+   *  deleted since is history: there is nothing left to fix or run again.
+   *  Absent when the list could not be read, and then every run counts. */
+  workflowsNow?: ReadonlySet<string>;
 }
 
 export type WorkReviewKind = 'run_failed' | 'run_waiting' | 'chat_waiting' | 'draft_unsent';
@@ -236,6 +240,13 @@ export function formatWhen(thenMs: number, nowMs: number, mode: 'at' | 'since'):
   return mode === 'at' ? `on ${date}` : `since ${date}`;
 }
 
+/** Where an account refusal came from, when the provider's words link to
+ *  it: the place the owner goes to fix the account. */
+function refusingHost(error: string | undefined): string | null {
+  const host = error?.match(/https?:\/\/([a-z0-9-]+(?:\.[a-z0-9-]+)+)/i)?.[1]?.toLowerCase();
+  return host ? host.replace(/^(?:api|www)\./, '') : null;
+}
+
 function short(text: string, max = 140): string {
   const clean = text.replace(/\s+/g, ' ').trim();
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
@@ -289,9 +300,11 @@ export function deriveWorkReviewCandidates(
   const observedAt = new Date(nowMs).toISOString();
   const failureSince = lastTickMs === null ? nowMs - config.failureLookbackMs : Math.max(lastTickMs, nowMs - config.failureLookbackMs);
   const tooOld = nowMs - config.maxAgeMs;
+  const gone = (run: WorkRunObservation) => observation.workflowsNow !== undefined && !observation.workflowsNow.has(run.workflow);
 
   for (const run of observation.runs) {
     if (run.targetStepId) continue; // a one-step try is the owner testing, not work
+    if (gone(run)) continue;
     if (IGNORED_RUN_STATUSES.has(run.status)) continue;
     const finished = ms(run.finishedAt) ?? ms(run.createdAt);
     if (FAILED_RUN_STATUSES.has(run.status)) {
@@ -316,7 +329,7 @@ export function deriveWorkReviewCandidates(
   // naming every workflow whose latest real run failed on it.
   const latestByWorkflow = new Map<string, { run: WorkRunObservation; finished: number }>();
   for (const run of observation.runs) {
-    if (run.targetStepId || (run.status !== 'completed' && !FAILED_RUN_STATUSES.has(run.status))) continue;
+    if (run.targetStepId || gone(run) || (run.status !== 'completed' && !FAILED_RUN_STATUSES.has(run.status))) continue;
     const finished = ms(run.finishedAt) ?? ms(run.createdAt);
     if (finished === null) continue;
     const seen = latestByWorkflow.get(run.workflow);
@@ -334,12 +347,15 @@ export function deriveWorkReviewCandidates(
     const workflows = group.map(({ run }) => run.workflow);
     const names = workflows.map((workflow) => readableWorkflowName(workflow));
     const latest = group[0]!;
+    // The card says why in plain words and where the refusal came from; the
+    // run's own error text is a diagnostic, not something to read the owner.
+    const host = refusingHost(latest.run.error);
     out.push({
       key: accountCauseKey(cause),
       kind: 'run_failed',
       subject: words.subject,
       detail: `${names.length === 1 ? `${names[0]} stopped` : `${names.length} workflows stopped`} because ${words.why}`
-        + `${names.length === 1 ? '' : `: ${names.join(', ')}`}. Latest ${formatWhen(latest.finished, nowMs, 'at')}: ${short(latest.run.error ?? '', 160)}`,
+        + `${names.length === 1 ? '' : `: ${names.join(', ')}`}. Latest ${formatWhen(latest.finished, nowMs, 'at')}${host ? `, refused by ${host}` : ''}.`,
       ref: { type: 'account_cause', id: cause },
       refs: group.map(({ run }) => run.runId).slice(0, 20),
       count: group.length,
@@ -508,13 +524,16 @@ export async function runWorkReviewTick(deps: WorkReviewDeps): Promise<WorkRevie
   });
   // An open cause item follows what the cause stops now. A workflow newly
   // stopped on it replaces the card, quietly, so one cause stays one card.
+  // One that left (it ran cleanly, or was deleted) corrects a card the owner
+  // still has open, and never brings back a card they put away.
   const refreshed: WorkReviewItem[] = [];
   for (const c of candidates) {
     const item = state.items[c.key];
     if (!item || item.retiredAt || !c.workflows) continue;
     const joined = c.workflows.filter((workflow) => !item.workflows?.includes(workflow));
+    const left = (item.workflows ?? []).filter((workflow) => !c.workflows!.includes(workflow));
     const now = { subject: c.subject, detail: c.detail, refs: c.refs, count: c.count, workflows: c.workflows, observedAt: c.observedAt };
-    if (joined.length === 0) { Object.assign(item, now); continue; }
+    if (joined.length === 0 && (left.length === 0 || item.acknowledgedAt)) { Object.assign(item, now); continue; }
     const notification = buildWorkReviewNotification({ ...item, ...now }, at, 'quiet');
     try { deps.publish(notification); } catch { continue; } // the next tick tries again
     if (item.notificationId) { try { deps.markNotificationRead(item.notificationId); } catch { /* the new card stands */ } }

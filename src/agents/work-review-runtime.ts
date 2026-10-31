@@ -13,6 +13,7 @@ import { BASE_DIR } from '../config.js';
 import { withDaemonRuntimePhase } from '../daemon/phase.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { readWorkflowRunInventoryFile } from '../execution/workflow-run-inventory.js';
+import { listWorkflows } from '../memory/workflow-store.js';
 import { listRuns } from '../runtime/run-events.js';
 import { addNotification, getNotification, markNotificationRead } from '../runtime/notifications.js';
 import { tryJevHeartbeatItemVerdict } from '../runtime/jev/control-plane.js';
@@ -143,9 +144,21 @@ export function observeDrafts(): DraftObservation[] {
   return out;
 }
 
+/** The workflows the owner has now, by display name and folder name (a run
+ *  record names its workflow either way). Undefined when the list can't be
+ *  read, so a read failure never hides a real stop. */
+export function observeWorkflowsNow(): ReadonlySet<string> | undefined {
+  try {
+    return new Set(listWorkflows().flatMap((entry) => [entry.name, entry.data.name]));
+  } catch {
+    return undefined;
+  }
+}
+
 export async function observeWork(): Promise<{ observation: WorkObservation; readFailures: number }> {
   const { runs, failures } = observeWorkflowRuns();
-  const observation: WorkObservation = { runs, chats: observeWaitingChats(), drafts: observeDrafts() };
+  const workflowsNow = observeWorkflowsNow();
+  const observation: WorkObservation = { runs, chats: observeWaitingChats(), drafts: observeDrafts(), ...(workflowsNow ? { workflowsNow } : {}) };
   return { observation, readFailures: failures };
 }
 
