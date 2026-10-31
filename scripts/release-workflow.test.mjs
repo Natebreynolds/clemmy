@@ -424,6 +424,10 @@ test('stapling retries a lost connection to Apple and never retries another fail
   await assert.rejects(run([68, 68, 68, 68]), /failed with status 68/, 'the retries are bounded');
   assert.equal(isStapleFailure(new Error('Failed to staple your application with code: 68')), true);
   assert.equal(isStapleFailure(new Error('Notarization failed: Invalid')), false, 'a rejected notarization is never treated as a staple problem');
+  assert.match(dualArchScriptText, /validate_staple\(\) \{[\s\S]*\$status -ne 68 && \$status -ne 65/);
+  assert.doesNotMatch(dualArchScriptText, /^\s*xcrun stapler validate "\$(app|dmg)"$/m, 'the release script checks a staple only through the retrying check');
+  assert.match(dualArchScriptText, /validate_staple "\$app"/);
+  assert.match(dualArchScriptText, /validate_staple "\$dmg"/);
   for (const hook of [dmgHookText, readFileSync(new URL('../apps/desktop/build/notarize.cjs', import.meta.url), 'utf-8')]) {
     assert.match(hook, /stapleWithRetry\(/);
     assert.match(hook, /if \(!isStapleFailure\(err\)\) throw err;/);

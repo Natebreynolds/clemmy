@@ -26,6 +26,23 @@ cleanup() {
 
 trap cleanup EXIT
 
+# stapler reads the notarization ticket over the network. A hosted runner can
+# lose that connection (exit 68) or see a fresh ticket before it is published
+# (65): wait and check again. Any other status fails the release at once.
+validate_staple() {
+  local target=$1 attempt=1 status=0
+  while true; do
+    xcrun stapler validate "$target" && return 0 || status=$?
+    if [[ $status -ne 68 && $status -ne 65 ]] || (( attempt >= 6 )); then
+      echo "::error::stapler validate $target failed with status $status"
+      return "$status"
+    fi
+    echo "  [staple] validate $target exited $status; retrying in 30s ($attempt/6)"
+    sleep 30
+    attempt=$((attempt + 1))
+  done
+}
+
 verify_native_arch() {
   local arch="$1"
   local expected="$2"
@@ -312,7 +329,7 @@ verify_packaged_app() {
 
   if is_signed_release; then
     codesign --verify --deep --strict --verbose=2 "$app"
-    xcrun stapler validate "$app"
+    validate_staple "$app"
     spctl --assess --type execute --verbose=4 "$app"
 
     local app_signature
@@ -359,7 +376,7 @@ verify_dmg_artifacts() {
   while IFS= read -r dmg; do
     found=1
     codesign --verify --verbose=2 "$dmg"
-    xcrun stapler validate "$dmg"
+    validate_staple "$dmg"
     spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg"
   done < <(find "$DESKTOP_DIR/release" -maxdepth 1 -name 'Clementine-*.dmg' -type f -print)
   (( found == 1 )) || { echo "::error::no packaged DMGs found"; exit 1; }
