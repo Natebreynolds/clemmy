@@ -86,6 +86,11 @@ function renderServerLine(server: ManagedMcpServer): string {
   return `- ${server.name} [${status}] (${server.type}, ${source}${state}${creds}): ${server.description}`;
 }
 
+/** The next step for a missing key, read with the status itself. */
+export const MISSING_KEY_NEXT_STEP = 'A key the owner has not entered yet: ask them for it with ask_user_question in your own words. '
+  + 'Your question shows them a hidden field that saves the key straight to that server, so it never enters the chat. '
+  + 'Never ask them to paste or type a key into the chat.';
+
 export function registerMcpStatusTools(server: McpServer): void {
   server.tool(
     'mcp_status',
@@ -141,9 +146,13 @@ export function registerMcpStatusTools(server: McpServer): void {
         }),
       };
 
+      // Read by Clem with the result itself: the tool's description is not in
+      // front of her when the status arrives through a carrier.
+      const missingKeys = payload.servers.some((item) => item.enabled !== false && item.unsetEnvKeys.length > 0);
       return textResult([
         `MCP server matches (${servers.length}/${allServers.length}):`,
         lines.length > 0 ? lines.join('\n') : 'No matching MCP servers found.',
+        ...(missingKeys ? ['', MISSING_KEY_NEXT_STEP] : []),
         '',
         'RAW:',
         JSON.stringify(payload, null, 2),
