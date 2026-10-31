@@ -118,3 +118,27 @@ test('the driver\'s command-line answer reads as a result replay understands; an
     { session: 'replay' });
   assert.deepEqual(replayed, { status: 'done', steps: 2 });
 });
+
+test('a window learned from the app\'s own launch answer counts, and a window renamed by what it shows is still found once', async () => {
+  const launchedWithWindows = ok({ pid: 79837, windows: [
+    { app_name: 'Notes', title: 'TEST FIXTURE folder', window_id: 7516, is_on_screen: true },
+    { app_name: 'Notes', title: '', window_id: 8583, is_on_screen: false },
+  ] });
+  const extracted = extractComputerRecipe([
+    { tool: 'cua-driver__launch_app', args: { bundle_id: 'com.apple.Notes' }, result: launchedWithWindows },
+    { tool: 'cua-driver__hotkey', args: { pid: 79837, window_id: 7516, keys: ['cmd', 'n'] }, result: ok({}) },
+    { tool: 'cua-driver__type_text', args: { pid: 79837, window_id: 7516, text: 'TEST FIXTURE replay note' }, result: ok({}) },
+  ]);
+  assert.equal(extracted.status, 'ready', JSON.stringify(extracted));
+  if (extracted.status !== 'ready') return;
+  assert.deepEqual(extracted.recipe.steps[1], { kind: 'window', app: 'Notes', title: 'TEST FIXTURE folder' });
+  const replayWith = (list: Array<{ title: string; id: number; onScreen?: boolean }>) => replayComputerRecipe(extracted.recipe, async (tool) => {
+    if (tool === 'launch_app') return ok({ pid: 900 });
+    if (tool === 'list_windows') return ok({ windows: list.map((window) => ({ app_name: 'Notes', title: window.title, window_id: window.id, is_on_screen: window.onScreen ?? true })) });
+    return ok({});
+  }, { session: 'replay' });
+  assert.deepEqual(await replayWith([{ title: 'Another folder', id: 31 }, { title: '', id: 32, onScreen: false }]), { status: 'done', steps: 4 },
+    'the folder changed, the window did not');
+  const two = await replayWith([{ title: 'Folder A', id: 31 }, { title: 'Folder B', id: 33 }]);
+  assert.equal(two.status, 'needs_clem', 'two titled windows and none named as before: Clem chooses');
+});

@@ -99,17 +99,17 @@ export function extractComputerRecipe(calls: readonly ComputerTraceCall[]): Comp
   for (const call of calls) {
     const tool = bare(call.tool);
     if (failed(call.result)) continue;
-    if (tool === 'list_windows') {
-      const windows = structured(call.result)?.windows;
-      for (const window of Array.isArray(windows) ? windows : []) {
-        const entry = record(window);
-        const id = Number(entry?.window_id);
-        const title = typeof entry?.title === 'string' ? entry.title : typeof entry?.window_title === 'string' ? entry.window_title : '';
-        const app = typeof entry?.app_name === 'string' ? entry.app_name : '';
-        if (Number.isSafeInteger(id) && title && app) windowTitles.set(id, { app, title });
-      }
-      continue;
+    // Any result that lists windows names them: list_windows, and launch_app,
+    // whose answer already carries the app's windows.
+    const listed = structured(call.result)?.windows;
+    for (const window of Array.isArray(listed) ? listed : []) {
+      const entry = record(window);
+      const id = Number(entry?.window_id);
+      const title = typeof entry?.title === 'string' ? entry.title : typeof entry?.window_title === 'string' ? entry.window_title : '';
+      const app = typeof entry?.app_name === 'string' ? entry.app_name : '';
+      if (Number.isSafeInteger(id) && title && app) windowTitles.set(id, { app, title });
     }
+    if (tool === 'list_windows') continue;
     if (tool === 'get_window_state') {
       const snapshot = parseWindowSnapshot(call.result);
       if (snapshot) snapshots.set(snapshot.snapshotId, snapshot);
@@ -196,13 +196,16 @@ export async function replayComputerRecipe(recipe: ComputerRecipeV1, call: Compu
     if (pid === null) return stop(at, 'no app was opened first');
     if (step.kind === 'window') {
       const result = await call('list_windows', { app: step.app, pid, session: options.session });
-      const windows = structured(result)?.windows;
-      const matches = (Array.isArray(windows) ? windows : []).map(record).filter((window) => {
-        const title = typeof window?.title === 'string' ? window.title : window?.window_title;
-        return title === step.title;
-      });
+      const windows = (Array.isArray(structured(result)?.windows) ? structured(result)!.windows as unknown[] : []).map(record);
+      const titleOf = (window: Record<string, unknown> | null) => typeof window?.title === 'string' ? window.title : window?.window_title;
+      const exact = windows.filter((window) => titleOf(window) === step.title);
+      // A window titled by what it shows (Notes names its window after the
+      // open folder) keeps no fixed title: the app's one titled on-screen
+      // window is the same window. Several of them stop for Clem.
+      const main = windows.filter((window) => typeof titleOf(window) === 'string' && titleOf(window) !== '' && window?.is_on_screen !== false);
+      const matches = exact.length > 0 ? exact : main;
       if (failed(result) || matches.length !== 1) {
-        return stop(at, matches.length === 0 ? `no "${step.title}" window is open` : `${matches.length} windows are titled "${step.title}"`);
+        return stop(at, matches.length === 0 ? `no "${step.title}" window is open` : `${matches.length} windows could be "${step.title}"`);
       }
       windowId = Number(matches[0]!.window_id);
       continue;
