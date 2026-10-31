@@ -288,6 +288,13 @@ function manifestMeter(
   return { done, total: Math.max(total, done + failed), failed };
 }
 
+/** The saved agent a worker ran as, from the host's own worker event. */
+export function workerHelperAgent(d: Record<string, unknown>): { id: string; name: string } | undefined {
+  const id = typeof d.agentId === 'string' ? d.agentId.trim() : '';
+  const name = typeof d.agentName === 'string' ? d.agentName.trim().slice(0, 64) : '';
+  return id && name ? { id, name } : undefined;
+}
+
 export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () => number = Date.now): ActivityItem[] {
   if (readLiveApprovalControl(ev)) return prev;
   const d = (ev.data ?? {}) as Record<string, unknown>;
@@ -599,17 +606,19 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent, now: () =
       if (!item) return prev;
       const role = typeof d.role === 'string' ? d.role : '';
       const modelName = helperModelName(model);
+      const helperAgent = workerHelperAgent(d);
       // A helper rerun on the same item (a different model, a retry) replaces
       // its row rather than stacking a second one under the same id.
       return [...prev.filter((a) => !(a.kind === 'agent' && a.id === `a-${item}`)), {
         id: `a-${item}`,
         kind: 'agent',
-        label: role ? `${role}: ${item}` : item,
+        label: helperAgent ? `${helperAgent.name}: ${item}` : role ? `${role}: ${item}` : item,
         detail: model || undefined,
         provider: providerFor(d, model),
         status: 'running',
         ...(modelName ? { modelName } : {}),
         ...(role.trim() ? { helperFor: role.trim().slice(0, 80) } : {}),
+        ...(helperAgent ? { helperAgent } : {}),
       }];
     }
     case 'worker_result': {

@@ -7,6 +7,7 @@
  */
 import { useEffect, useState } from 'react';
 import { Wrench, Users, Check, X, Zap, Send, AlertCircle, CheckCircle2, Radio, Dot } from 'lucide-react';
+import { Link } from 'react-router-dom';
 import { cn } from '@/lib/cn';
 import type { ActivityItem } from '@/lib/useChat';
 import { turnModelName } from '@clem/chat-engine';
@@ -15,6 +16,11 @@ import {
   settleTerminalActivity,
   type ActivityTerminalOutcome,
 } from '@/lib/activity-presentation';
+
+/** The saved agent a helper ran as, one tap from its own page. */
+export function HelperAgentLink({ agent }: { agent: { id: string; name: string } }) {
+  return <Link to={`/agents/${encodeURIComponent(agent.id)}`} className="font-sans text-primary hover:underline">See {agent.name}</Link>;
+}
 
 export const PROVIDER_DOT: Record<NonNullable<ActivityItem['provider']>, string> = {
   claude: '#d97757',
@@ -149,6 +155,7 @@ export function ActivityRow({ a, now, live, showDetails = false, brainName }: {
           <span className="min-w-0 flex-1 truncate text-faint">→ {detailText}</span>
         )}
         {!detailVisible && <span className="flex-1" />}
+        {a.kind === 'agent' && a.helperAgent && <span className="shrink-0"><HelperAgentLink agent={a.helperAgent} /></span>}
         {a.excerpt && (
           <button
             type="button"

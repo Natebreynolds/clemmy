@@ -14,7 +14,7 @@ import { openFile, resolveDeliverablePath } from '@/lib/files';
 import { ArrowUpRight, Check, X, AlertCircle, Send, Zap, Users } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import type { ActivityItem } from '@/lib/useChat';
-import { BatchRow, PROVIDER_DOT, useNowTick } from '@/components/chat/ActivityFeed';
+import { BatchRow, HelperAgentLink, PROVIDER_DOT, useNowTick } from '@/components/chat/ActivityFeed';
 import { narrateActivity, settleTerminalActivity, type ActivityTerminalOutcome } from '@/lib/activity-presentation';
 import { activityCardHead, clockLabel, groupActivityByParent, stepElapsed } from '@/lib/activity-card';
 import { timelineSpan, type TimelineBounds } from '@clem/chat-engine';
@@ -129,6 +129,7 @@ export function StepRow({ a, now, live, nested, timeline }: { a: ActivityItem; n
         )}
       </span>
       <span className="flex items-center gap-2 pt-0.5 font-mono text-caption tabular-nums text-faint">
+        {a.kind === 'agent' && a.helperAgent && <HelperAgentLink agent={a.helperAgent} />}
         {a.deliverable && <OpenDeliverable file={a.deliverable} />}
         {a.excerpt && (
           <button type="button" onClick={() => setPeek(!showExcerpt)} aria-expanded={showExcerpt} className="font-sans transition-colors hover:text-muted">{showExcerpt ? 'hide' : 'peek'}</button>

@@ -220,6 +220,17 @@ export function findAgentRecord(idOrName: string): AgentRecord | null {
   return listAgentRecords().find((agent) => agent.name.toLowerCase() === lower || agent.id === agentIdFor(wanted)) ?? null;
 }
 
+/** The saved agent a worker runs as, by the id and name the owner sees. An
+ *  agent that no longer resolves names nothing; the worker still runs. */
+export function workerAgentIdentity(idOrName: string | null | undefined): { agentId: string; agentName: string } | null {
+  try {
+    const record = idOrName ? findAgentRecord(idOrName) : null;
+    return record ? { agentId: record.id, agentName: record.name } : null;
+  } catch {
+    return null;
+  }
+}
+
 export function createAgentRecord(draft: AgentDraft): SaveAgentResult {
   const name = String(draft.name ?? '').trim().slice(0, MAX_AGENT_NAME_CHARS);
   if (!name) return { ok: false, reason: 'name_required' };

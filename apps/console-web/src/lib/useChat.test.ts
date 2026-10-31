@@ -1054,6 +1054,19 @@ test('reduceActivity: codemode_program_summary folds into ONE "ran a batch progr
   assert.equal(a[1].status, 'failed');
 });
 
+test('reduceActivity: a worker that ran as a saved agent names the agent and keeps it through its result', () => {
+  let a: ActivityItem[] = [];
+  a = reduceActivity(a, ev('worker_started', { item: 'site-a', role: 'research', model: 'claude-opus-4-8', agentId: 'firm-scout', agentName: 'Firm Scout' }));
+  a = reduceActivity(a, ev('worker_result', { item: 'site-a', ok: true, model: 'claude-opus-4-8' }));
+  a = reduceActivity(a, ev('worker_started', { item: 'site-b', role: 'research', model: 'claude-opus-4-8' }));
+  const [scout, plain] = a.filter((x) => x.kind === 'agent');
+  assert.deepEqual(scout.helperAgent, { id: 'firm-scout', name: 'Firm Scout' });
+  assert.equal(scout.label, 'Firm Scout: site-a');
+  assert.equal(scout.status, 'done');
+  assert.equal(plain.helperAgent, undefined);
+  assert.equal(plain.label, 'research: site-b');
+});
+
 test('reduceActivity: worker results count K of N and keep the item name as the plain-human default', () => {
   let a: ActivityItem[] = [];
   a = reduceActivity(a, ev('worker_started', { item: 'morganandmorgan.com', role: 'scraper', model: 'claude-opus-4-8' }));

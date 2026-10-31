@@ -14,6 +14,7 @@ import { getRuntimeEnv } from '../config.js';
 import { resolveRoleModel } from '../runtime/harness/model-roles.js';
 import { routeWorkerModel, type WorkerRouteTrace } from '../runtime/harness/worker-model-route.js';
 import { resolveWorkerAgentRequest } from './agent-binding.js';
+import { workerAgentIdentity } from './agent-record.js';
 import { agentHandoffNote } from './session-agent.js';
 import { projectHandoffNote } from '../projects/session-project.js';
 import { recordWorkerModelOffer } from '../runtime/harness/worker-model-offer.js';
@@ -3596,7 +3597,7 @@ export async function buildOrchestratorAgent(options: BuildOrchestratorAgentOpti
       if (sessionId) {
         if (useClaudeSdkWorker) {
           try {
-            appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, sourceUserSeq, parentLogicalCallId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, agent: input.agent || undefined, lane: 'orchestrator' } });
+            appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, sourceUserSeq, parentLogicalCallId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, agent: input.agent || undefined, ...(workerAgentIdentity(input.agent) ?? {}), lane: 'orchestrator' } });
           } catch { /* telemetry is best-effort */ }
         }
         if (manifestBinding) {

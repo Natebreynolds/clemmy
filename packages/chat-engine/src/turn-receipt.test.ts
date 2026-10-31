@@ -142,6 +142,30 @@ test('a helper on another model is credited by name and by the work it was hande
   );
 });
 
+test('a helper that ran as a saved agent is named by the agent, on any model, and its row carries the agent', () => {
+  const rows = fold([
+    { type: 'turn_model_routed', data: { model: 'vendor-ai/Vendor-V4.1-Fast', provider: 'byo' } },
+    { type: 'worker_started', data: { item: 'site-a', role: 'research', model: 'acme-flagship-5', provider: 'claude', agentId: 'firm-scout', agentName: 'Firm Scout' } },
+    { type: 'worker_started', data: { item: 'site-b', role: 'research', model: 'acme-flagship-5', provider: 'claude', agentId: 'firm-scout', agentName: 'Firm Scout' } },
+    { type: 'worker_started', data: { item: 'site-c', role: 'research', model: 'vendor-ai/Vendor-V4.1-Fast', provider: 'byo', agentId: 'local-desk', agentName: 'Local Desk' } },
+    { type: 'worker_started', data: { item: 'site-d', role: 'research', model: 'vendor-ai/Vendor-V4.1-Fast', provider: 'byo', agentId: 'only-id' } },
+    { type: 'worker_result', data: { item: 'site-a', ok: true, model: 'acme-flagship-5' } },
+    { type: 'worker_result', data: { item: 'site-b', ok: true, model: 'acme-flagship-5' } },
+    { type: 'worker_result', data: { item: 'site-c', ok: true, model: 'vendor-ai/Vendor-V4.1-Fast' } },
+    { type: 'worker_result', data: { item: 'site-d', ok: true, model: 'vendor-ai/Vendor-V4.1-Fast' } },
+  ]);
+  const scout = rows.find((row) => row.id === 'a-site-a');
+  assert.deepEqual(scout?.helperAgent, { id: 'firm-scout', name: 'Firm Scout' });
+  assert.equal(scout?.label, 'Firm Scout: site-a');
+  assert.equal(rows.find((row) => row.id === 'a-site-d')?.helperAgent, undefined, 'an agent without a resolved name is not invented');
+  assert.deepEqual(turnHelpers(rows), [
+    { modelName: 'Acme Flagship 5', agentName: 'Firm Scout', count: 2, work: 'research' },
+    { modelName: 'Vendor V4.1 Fast', agentName: 'Local Desk', count: 1, work: 'research' },
+  ]);
+  assert.equal(turnByline(rows),
+    'Vendor V4.1 Fast did the work, Firm Scout (Acme Flagship 5) handled research, Local Desk handled research');
+});
+
 test('helpers on the brain model are the brain work, and a failed helper earns no credit', () => {
   const rows = fold([
     { type: 'turn_model_routed', data: { model: 'vendor-ai/Vendor-V4.1-Fast', provider: 'byo' } },

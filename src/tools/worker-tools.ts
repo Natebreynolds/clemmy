@@ -3,6 +3,7 @@ import { getSessionWorkerModelOverride } from '../runtime/harness/session-role-o
 import { WorkerToolCallSchema, uniformFailureSignature, workerCallItems, workerPacketKey, workerResultIndicatesFailure, type WorkerToolCall, type WorkerToolInput } from '../agents/worker-job-packet.js';
 import { bindWorkerPacketExpectedWork } from '../runtime/harness/expected-work-admission.js';
 import { recordSubagentRun, findCompletedSubagentOutput } from '../agents/subagent-runs.js';
+import { workerAgentIdentity } from '../agents/agent-record.js';
 import { runClaudeAgentSdkWorker, claudeWorkerScopeId } from '../runtime/harness/claude-agent-worker.js';
 import { acquireWorkerSlot, workerBatchPoolWidth } from '../agents/worker-concurrency.js';
 import {
@@ -749,7 +750,7 @@ export function registerWorkerTools(server: McpServer): void {
       // running specialist immediately, not only when worker_result lands). Cheap,
       // fail-open. provider/role let the UI badge it (Claude/Codex/GLM + specialty).
       try {
-        appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, sourceUserSeq, parentLogicalCallId: getToolOutputContext()?.callId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, agent: input.agent || undefined, lane: 'sdk_brain' } });
+        appendEvent({ sessionId, turn: 0, role: 'system', type: 'worker_started', data: { item: input.item, packetKey, sourceUserSeq, parentLogicalCallId: getToolOutputContext()?.callId, ...(batchLease ? { batchKey: batchLease.batchKey, generationId: batchLease.generationId } : {}), model: workerModel, provider: workerProvider, role: input.intent || undefined, agent: input.agent || undefined, ...(workerAgentIdentity(input.agent) ?? {}), lane: 'sdk_brain' } });
       } catch { /* telemetry is best-effort */ }
       if (manifestBinding) {
         try {

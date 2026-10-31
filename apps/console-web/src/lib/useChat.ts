@@ -1,7 +1,7 @@
 import { answeredPausedTurn, approvalResultFields, normalizePendingActionPublicResult } from '@clem/chat-engine';
 import type { PendingActionResultRecord } from '@clem/chat-engine';
 import { advanceRunEventPage, recentEventsUrl, type RecentEventsPage } from '../features/conversations/lib/run-event-buffer';
-import { activityTerminalOutcomeForMessageStatus, advanceWorkflowChildActivity, toolRunsInApp, clearModelRetryProgress, isModelRetryProgressBoundary, readModelRetryProgress, readWorkflowQueueDispatch, reduceActivity as reduceSharedActivity, reduceLifecycle, settleTerminalActivity, updateWorkflowDispatchActivity, workflowDispatchLabel, workflowDispatchText, workflowStopNotice, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
+import { activityTerminalOutcomeForMessageStatus, advanceWorkflowChildActivity, toolRunsInApp, clearModelRetryProgress, isModelRetryProgressBoundary, readModelRetryProgress, readWorkflowQueueDispatch, reduceActivity as reduceSharedActivity, reduceLifecycle, settleTerminalActivity, updateWorkflowDispatchActivity, workerHelperAgent, workflowDispatchLabel, workflowDispatchText, workflowStopNotice, type HarnessEvent as SharedHarnessEvent } from '@clem/chat-engine';
 import type { ChatStopReceipt, DelegatedWorkControl, LiveAnswerDraft, ModelRuleOffer, WorkflowCardData, TerminalFacts } from '@clem/chat-engine';
 import { boundedModelId, modelDisplayName, followUpSendsAfter, steerRefusalWaitsForTurnEnd, answerCheckCorrectedSource, applyAnswerCheckCorrection, applyReviewSettlement, readReviewSettlement } from '@clem/chat-engine';
 import { applySteerReceiptEvent, hasSteerAdmission, steerFollowUpRequestId, unhandledSteerFollowUps, acceptedApprovalResumeSource, ApprovalReplyObserver, approvalWithCanonicalEdits, applyStreamToken, approvalPreviewFrom, approvalResolutionFrom, approvalRevisionFrom, applyApprovalDecisionAck, approvalDecisionFallback, readApprovalDecisionAck, readLiveApprovalControl, readQuestionOptions, readKeyRequest, type KeyRequest, terminalCompletionPresentation, withoutAnswerDraft } from '@clem/chat-engine';
@@ -117,6 +117,8 @@ export interface ActivityItem {
   modelName?: string;
   /** kind 'agent' rows: the kind of work the brain handed this helper. */
   helperFor?: string;
+  /** kind 'agent' rows: the saved agent this helper ran as, by id and name. */
+  helperAgent?: { id: string; name: string };
   /** Offer rows only: keep a model the owner named for one kind of work. */
   offer?: ModelRuleOffer;
   /** A workflow this turn created or changed, as saved; drawn under the reply. */
@@ -1147,14 +1149,16 @@ export function reduceActivity(prev: ActivityItem[], ev: HarnessEvent): Activity
       if (!item) return prev;
       const role = typeof d.role === 'string' ? d.role : '';
       const modelName = helperModelName(model);
+      const helperAgent = workerHelperAgent(d);
       // A helper rerun on the same item replaces its row instead of stacking
       // a second row under the same id.
       return [...prev.filter((a) => !(a.kind === 'agent' && a.id === `a-${item}`)), {
-        id: `a-${item}`, kind: 'agent', label: role ? `${role}: ${item}` : item, detail: model || undefined,
+        id: `a-${item}`, kind: 'agent', label: helperAgent ? `${helperAgent.name}: ${item}` : role ? `${role}: ${item}` : item, detail: model || undefined,
         provider: providerFor(d, model), status: 'running', startedAt: at,
         ...(stepOf(ev) ? { step: stepOf(ev) } : {}),
         ...(modelName ? { modelName } : {}),
         ...(role.trim() ? { helperFor: role.trim().slice(0, 80) } : {}),
+        ...(helperAgent ? { helperAgent } : {}),
       }];
     }
     case 'worker_result': {

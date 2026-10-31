@@ -286,6 +286,8 @@ export interface ActivityItem {
   /** kind 'agent' rows: the kind of work the brain handed this helper, in
    *  the brain's own words, when it named one. */
   helperFor?: string;
+  /** kind 'agent' rows: the saved agent this helper ran as, by id and name. */
+  helperAgent?: { id: string; name: string };
   /** Offer rows only: keep a model the owner named for one kind of work.
    *  Rendered with the turn's receipt, never as an activity row. */
   offer?: ModelRuleOffer;

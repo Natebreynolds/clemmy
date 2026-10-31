@@ -83,51 +83,60 @@ export function turnReviewerName(
 /** A model other than the brain that did part of the turn as a helper. */
 export interface TurnHelper {
   modelName: string;
+  /** The saved agent these helpers ran as, by its name. */
+  agentName?: string;
   /** The kind of work, in the brain's words, when every one of these helpers named the same one. */
   work?: string;
   count: number;
 }
 
 /** Helpers that ran on a model other than the brain, one entry per model,
- *  in the order they first appeared. Helpers on the brain's own model are
- *  the brain's work and are not listed. */
+ *  in the order they first appeared, and helpers that ran as a saved agent,
+ *  one entry per agent and model, whatever the model. Other helpers on the
+ *  brain's own model are the brain's work and are not listed. */
 export function turnHelpers(
-  activity: readonly Pick<ActivityItem, 'id' | 'kind' | 'status' | 'modelName' | 'helperFor'>[] | undefined,
+  activity: readonly Pick<ActivityItem, 'id' | 'kind' | 'status' | 'modelName' | 'helperFor' | 'helperAgent'>[] | undefined,
 ): TurnHelper[] {
   if (!activity) return [];
   const brain = turnModelName(activity);
-  const byModel = new Map<string, { count: number; works: Set<string> }>();
+  const byHelper = new Map<string, { modelName: string; agentName?: string; count: number; works: Set<string> }>();
   for (const row of activity) {
     if (row.kind !== 'agent' || row.status === 'failed') continue;
     const name = row.modelName?.trim();
-    if (!name || name === brain) continue;
-    const entry = byModel.get(name) ?? { count: 0, works: new Set<string>() };
+    const agentName = row.helperAgent?.name.trim() || undefined;
+    if (!name || (name === brain && !agentName)) continue;
+    const key = `${agentName ?? ''}\0${name}`;
+    const entry = byHelper.get(key) ?? { modelName: name, ...(agentName ? { agentName } : {}), count: 0, works: new Set<string>() };
     entry.count += 1;
     const work = row.helperFor?.trim();
     if (work) entry.works.add(work);
-    byModel.set(name, entry);
+    byHelper.set(key, entry);
   }
-  return [...byModel.entries()].map(([modelName, entry]) => ({
-    modelName,
+  return [...byHelper.values()].map((entry) => ({
+    modelName: entry.modelName,
+    ...(entry.agentName ? { agentName: entry.agentName } : {}),
     count: entry.count,
     ...(entry.works.size === 1 ? { work: [...entry.works][0] } : {}),
   }));
 }
 
-function helperPhrase(helper: TurnHelper): string {
-  return helper.work ? `${helper.modelName} handled ${helper.work}` : `${helper.modelName} helped`;
+function helperPhrase(helper: TurnHelper, brain: string | undefined): string {
+  const who = helper.agentName
+    ? `${helper.agentName}${helper.modelName !== brain ? ` (${helper.modelName})` : ''}`
+    : helper.modelName;
+  return helper.work ? `${who} handled ${helper.work}` : `${who} helped`;
 }
 
 /** "<brain> did the work, <helper> handled <work>, <reviewer> checked it."
  *  Every model that produced the answer, in words, from the turn's own
  *  events. Empty when the turn named no model. */
 export function turnByline(
-  activity: readonly Pick<ActivityItem, 'id' | 'kind' | 'status' | 'verdict' | 'modelName' | 'helperFor' | 'agentName'>[] | undefined,
+  activity: readonly Pick<ActivityItem, 'id' | 'kind' | 'status' | 'verdict' | 'modelName' | 'helperFor' | 'helperAgent' | 'agentName'>[] | undefined,
   terminal?: Pick<TerminalFacts, 'review'>,
 ): string {
   const worker = turnModelName(activity);
   const reviewer = turnReviewerName(activity);
-  const helpers = turnHelpers(activity).map(helperPhrase);
+  const helpers = turnHelpers(activity).map((helper) => helperPhrase(helper, worker));
   const verb = turnReview(activity, terminal) === 'checked' ? 'checked' : 'reviewed';
   const parts = [
     ...(worker ? [`${worker} did the work`] : []),

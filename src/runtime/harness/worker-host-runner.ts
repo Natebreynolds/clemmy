@@ -20,6 +20,7 @@ import { prepareWorkerResultShares } from './worker-retained-results.js';
 import { resolveLocalRetainedOutputRead } from './retained-output-read.js';
 import { acceptedTaskIdFor, currentLogicalCall } from './attempt-identity.js';
 import { resolveEffectiveProviderForModel } from './byo-providers.js';
+import { workerAgentIdentity } from '../../agents/agent-record.js';
 import {
   appendEvent, beginRunAttempt, createSession, finishRunAttempt, getSession, getToolOutput,
   listEvents, recordRunAttemptUserInput,
@@ -128,7 +129,8 @@ export async function runPacketWorkerWithHost(input: {
   let delegation: Awaited<ReturnType<typeof delegateExpectedWorkToChild>> | null = null;
   appendEvent({ sessionId: input.parentSessionId, turn: 0, role: 'system', type: 'worker_started',
     data: { ...lineage, model: input.modelId, provider: resolveEffectiveProviderForModel(input.modelId),
-      role: input.input.intent, childSessionId: session.id, childSourceUserSeq: childSource.seq, childAttemptId: attempt.attemptId } });
+      role: input.input.intent, ...(workerAgentIdentity(input.input.agent) ?? {}),
+      childSessionId: session.id, childSourceUserSeq: childSource.seq, childAttemptId: attempt.attemptId } });
   let completed = false;
   // Qualify before closing the child attempt so it agrees with the parent
   // receipt/reuse disposition. Preserve the worker's prose as partial evidence.

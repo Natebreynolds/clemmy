@@ -23,6 +23,7 @@ const {
   getAgentRecord,
   listAgentRecords,
   updateAgentRecord,
+  workerAgentIdentity,
   HOST_AGENT_ID,
 } = await import('./agent-record.js');
 const { AGENTS_DIR, AGENT_STATE_DIR, agentFilePath } = await import('../tools/shared.js');
@@ -65,6 +66,13 @@ test('an agent is created, readable by id or name, and listed', () => {
   const onDisk = readFileSync(agentFilePath('prospect-research-desk'), 'utf8');
   assert.match(onDisk, /createdFrom: console/);
   assert.match(onDisk, /tools:\n {2}- sheets/);
+});
+
+test('a worker names the saved agent it ran as by id and name, from either, and nothing for an unknown one', () => {
+  assert.deepEqual(workerAgentIdentity('prospect-research-desk'), { agentId: 'prospect-research-desk', agentName: 'Prospect Research Desk' });
+  assert.deepEqual(workerAgentIdentity('Prospect Research Desk'), { agentId: 'prospect-research-desk', agentName: 'Prospect Research Desk' });
+  assert.equal(workerAgentIdentity('no-such-agent'), null);
+  assert.equal(workerAgentIdentity(undefined), null);
 });
 
 test('a duplicate or reserved name is refused rather than overwriting', () => {
