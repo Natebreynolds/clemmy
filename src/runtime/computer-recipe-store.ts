@@ -43,6 +43,13 @@ function argsOf(value: unknown): Record<string, unknown> {
 export function readComputerTrace(input: { sessionId: string; sourceUserSeq: number }): ComputerTraceCall[] {
   const seen = new Set<string>();
   const trace: ComputerTraceCall[] = [];
+  // How each call settled. A call the driver refused (one held for the
+  // owner's approval, then asked again) did not do the work: only the call
+  // that settled as succeeded belongs in what repeats.
+  const settled = new Map<string, string>();
+  for (const event of listEvents(input.sessionId, { types: ['tool_attempt_settled'], sinceSeq: input.sourceUserSeq })) {
+    if (typeof event.data.callId === 'string' && typeof event.data.kind === 'string') settled.set(event.data.callId, event.data.kind);
+  }
   for (const event of listEvents(input.sessionId, { types: ['tool_called'], sinceSeq: input.sourceUserSeq })) {
     if (Number(event.data.sourceUserSeq) !== input.sourceUserSeq) continue;
     const direct = typeof event.data.tool === 'string' && event.data.tool.startsWith(DRIVER_PREFIX) ? event.data.tool : '';
@@ -53,6 +60,11 @@ export function readComputerTrace(input: { sessionId: string; sourceUserSeq: num
     if (!tool || !callId || seen.has(callId)) continue;
     seen.add(callId);
     const args = carried ? argsOf(argsOf(event.data.arguments).args_json) : argsOf(event.data.args ?? event.data.arguments);
+    const settlement = settled.get(callId);
+    if (settlement !== undefined && settlement !== 'succeeded') {
+      trace.push({ tool, args, result: { result: { isError: true, content: [{ type: 'text', text: `settled ${settlement}` }] } } });
+      continue;
+    }
     const output = getToolOutput(input.sessionId, callId);
     trace.push({ tool, args, result: output?.output ?? null });
   }

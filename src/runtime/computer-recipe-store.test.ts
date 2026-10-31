@@ -70,3 +70,18 @@ test('a request that only looked is not saved, and another request\'s calls are 
   const later = appendEvent({ sessionId: 'task-looked', turn: 2, role: 'user', type: 'user_input_received', data: { text: 'next' } }).seq;
   assert.deepEqual(store.readComputerTrace({ sessionId: 'task-looked', sourceUserSeq: later }), []);
 });
+
+test('a call the driver refused before the owner approved it is left out; the approved one repeats once', () => {
+  const sourceUserSeq = request('task-refused-first', 'Start a TEST FIXTURE note', [
+    { tool: 'cua-driver__launch_app', args: { bundle_id: 'com.apple.Notes' }, output: structured({ pid: 1, windows: [{ app_name: 'Notes', title: 'Notes', window_id: 9 }] }), carried: true },
+    { tool: 'cua-driver__hotkey', args: { pid: 1, window_id: 9, keys: ['cmd', 'n'] }, output: '', carried: true },
+    { tool: 'cua-driver__hotkey', args: { pid: 1, window_id: 9, keys: ['cmd', 'n'] }, output: structured({}), carried: true },
+  ]);
+  appendEvent({ sessionId: 'task-refused-first', turn: 1, role: 'system', type: 'tool_attempt_settled',
+    data: { callId: 'call-task-refused-first-1', kind: 'uncertain_write', detail: 'provider_refused_envelope', sourceUserSeq } });
+  appendEvent({ sessionId: 'task-refused-first', turn: 1, role: 'system', type: 'tool_attempt_settled',
+    data: { callId: 'call-task-refused-first-2', kind: 'succeeded', sourceUserSeq } });
+  const saved = store.saveComputerTask({ sessionId: 'task-refused-first', sourceUserSeq });
+  assert.equal(saved.status, 'saved', JSON.stringify(saved));
+  if (saved.status === 'saved') assert.deepEqual(saved.task.recipe.steps.map((step) => step.kind), ['launch', 'window', 'hotkey']);
+});
