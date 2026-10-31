@@ -45,7 +45,7 @@ import {
   getAgent, getAgentCatalog, getAgentWork, deleteAgent,
   type AgentRecord, type AgentCatalog, type AgentWorker,
 } from '@/lib/agents';
-import { providerLabel } from '@clem/chat-engine';
+import { modelDisplayName, providerLabel } from '@clem/chat-engine';
 import { useSessions } from '@/features/conversations/hooks/useSessions';
 import { isMissingConversation, useSession } from '@/features/conversations/hooks/useSession';
 import { sessionKeys } from '@/features/conversations/hooks/keys';
@@ -531,7 +531,7 @@ function AgentPanel({
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(false);
 
-  const model = agent.model ? (catalog?.models?.find((m) => m.id === agent.model)?.label ?? agent.model) : null;
+  const model = agent.model ? (catalog?.models?.find((m) => m.id === agent.model)?.label ?? modelDisplayName(agent.model)) : null;
   const reaches = agent.skills.length + agent.workflows.length > 0;
 
   const remove = async () => {
@@ -688,7 +688,7 @@ function RecentWork({ agent }: { agent: AgentRecord }) {
                   <span className="min-w-0 flex-1">
                     <span className="block truncate text-small text-fg">{workerLabel(w)}</span>
                     <span className="block truncate text-caption text-faint">
-                      {providerLabel(w.provider)}{w.model ? ` · ${w.model}` : ''}{w.finishedAt ? ` · ${relativeTime(w.finishedAt)}` : ''}
+                      {providerLabel(w.provider)}{w.model ? ` · ${modelDisplayName(w.model)}` : ''}{w.finishedAt ? ` · ${relativeTime(w.finishedAt)}` : ''}
                     </span>
                   </span>
                   <st.Icon className={cn('h-4 w-4 shrink-0', st.className)} aria-label={st.title} />
