@@ -76,3 +76,18 @@ test('a concurrent edit after composition is preserved without mirroring an unsa
     assert.equal(environment.FIXTURE_KEY, 'old');
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+test('removing a saved key drops every declaration of it, keeps the rest byte for byte, and clears the running value', async () => {
+  const { removeMcpCredentialDeclaration, removeMcpServerCredential } = await import('./mcp-server-credential.js');
+  const text = '# keys\nOTHER_KEY="keep me"\nTEST_FIXTURE_KEY="first"\n  TEST_FIXTURE_KEY="second"\nTEST_FIXTURE_KEY_SUFFIX="keep"\n';
+  assert.deepEqual(removeMcpCredentialDeclaration(text, 'TEST_FIXTURE_KEY'),
+    { text: '# keys\nOTHER_KEY="keep me"\nTEST_FIXTURE_KEY_SUFFIX="keep"\n', removed: true });
+  assert.deepEqual(removeMcpCredentialDeclaration(text, 'NOT_THERE'), { text, removed: false });
+  let written: string | undefined;
+  const environment: Record<string, string | undefined> = { TEST_FIXTURE_KEY: 'second' };
+  assert.equal(removeMcpServerCredential('/tmp/test-fixture.env', 'TEST_FIXTURE_KEY', {
+    readText: () => text, writeText: (_file, next) => { written = next; }, environment,
+  }), true);
+  assert.equal(written, '# keys\nOTHER_KEY="keep me"\nTEST_FIXTURE_KEY_SUFFIX="keep"\n');
+  assert.equal('TEST_FIXTURE_KEY' in environment, false);
+});
