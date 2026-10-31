@@ -10,7 +10,7 @@ import { registerCloudBrowserRoutes } from '../channels/cloud-browser-routes.js'
 import { Readable } from 'node:stream';
 import { requestSpeech, spokenReplyText } from './voice-speech.js';
 import { createLiveVoiceSession, liveVoiceStatus } from './live-voice.js';
-import { approvalCardVoice } from '../runtime/harness/approval-card-voice.js';
+import { approvalCardVoiceForDisplay } from '../runtime/harness/approval-card-display.js';
 import { SAVED_SOURCE_SCRIPT_CONSENT_TOOL } from '../runtime/harness/saved-source-consent.js';
 import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
 import { captureFreshSourceSessionContext } from '../runtime/harness/source-session-context.js';
@@ -12667,7 +12667,7 @@ export function registerConsoleRoutes(
           args: r.args,
           // What will happen, where, through which app — never the carrier envelope.
           presentation: presentApprovalForHumans({ tool: r.tool, args: r.args, subject: r.subject,
-            ...cardVoiceFields(approvalCardVoice(r.sessionId, r.approvalId)) }),
+            ...cardVoiceFields(approvalCardVoiceForDisplay(r.sessionId, r.approvalId)) }),
           status: r.status,
           resolution: r.resolution,
           resourceFingerprint: fingerprint.result === 'unknown' ? undefined : {
@@ -15277,7 +15277,7 @@ export function registerConsoleRoutes(
           // The same words Needs you and the phone use: the request's own
           // subject, else the unwrapped provider call. Never the carrier.
           const presentation = presentApprovalForHumans({ tool: approval.tool, args: approval.args, subject: approval.subject,
-            ...cardVoiceFields(approvalCardVoice(approval.sessionId, approval.approvalId)) });
+            ...cardVoiceFields(approvalCardVoiceForDisplay(approval.sessionId, approval.approvalId)) });
           const subject = approval.subject?.trim();
           return {
             kind: 'harness-approval',

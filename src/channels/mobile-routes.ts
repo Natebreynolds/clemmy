@@ -7,7 +7,7 @@ import {
   registerNativeVoiceStatus,
   type NativeVoiceTerminal,
 } from './mobile-native-voice-status.js';
-import { approvalCardVoice } from '../runtime/harness/approval-card-voice.js';
+import { approvalCardVoiceForDisplay } from '../runtime/harness/approval-card-display.js';
 import { verifyConnectionSetup, connectionContinuationIdentity, withConnectionContinuationAdmission, connectionContinuationCancellationId, connectionContinuationTaskMode, type ConnectionContinuationVerification } from '../runtime/harness/connection-setup.js';
 import { recordBrainChosenForSession } from '../agents/session-agent-model.js';
 import { nextAnsweringModel } from '../agents/next-answering-model.js';
@@ -593,7 +593,7 @@ function serializeApprovalForMobile(row: approvalRegistry.PendingApprovalRow): {
   return {
     kind: 'harness',
     presentation: presentApprovalForHumans({ tool: row.tool, args: row.args, subject: row.subject,
-      ...cardVoiceFields(approvalCardVoice(row.sessionId, row.approvalId)) }),
+      ...cardVoiceFields(approvalCardVoiceForDisplay(row.sessionId, row.approvalId)) }),
     contentPreview: extractApprovalContentPreview(row.tool, row.args ?? undefined),
     ...(approvalPreviewProjection(row.args?.preview) ?? {}),
     approvalId: row.approvalId,

@@ -14,6 +14,7 @@ import type { UnifiedSessionTurn } from '../../types.js';
 import { listEvents, openEventLog } from './eventlog.js';
 import { ANSWER_CHECK_SOURCE_PREFIX } from './review-after-delivery.js';
 import { assertPublicPresentationText } from './turn-outcome.js';
+import { isHostApprovalStandIn } from './approval-card-display.js';
 import {
   isPublicRunFailureText,
   publicCompletionText,
@@ -127,11 +128,7 @@ function reconstructTranscript(sessionId: string, limit: number, includeDecorati
   const reopenedApprovalText = (presentation: { kind: string; text: string; approvalId?: string }): string => {
     const id = presentation.approvalId;
     if (presentation.kind !== 'approval' || !id) return presentation.text;
-    const filler = (presentation.text.startsWith('Approval required for ') && presentation.text.endsWith(`. Review ${id} to continue.`))
-      || (presentation.text.startsWith('Can I go ahead with ') && presentation.text.endsWith('? Say yes, or tell me what to change.'))
-      || (/^\d+ approvals are waiting, starting with /.test(presentation.text)
-        && presentation.text.endsWith(`(${id}). Approve or reject each and I'll continue.`));
-    return filler ? approvalAsks.get(id) || presentation.text : presentation.text;
+    return isHostApprovalStandIn(presentation.text, id) ? approvalAsks.get(id) || presentation.text : presentation.text;
   };
   // Pair each `conversation_superseded` marker with the nearest preceding
   // un-claimed no_structured_output completion (the marker is appended right
