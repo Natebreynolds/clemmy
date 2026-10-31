@@ -186,6 +186,9 @@ export interface WorkReviewDeps {
   judge?: (candidate: WorkReviewCandidate, rules: string[]) => Promise<WorkReviewJudgeVerdict | null>;
   publish: (n: NotificationRecord) => void;
   isNotificationRead: (id: string) => boolean;
+  /** The owner put this item's card away in Needs you (dismissed, or
+   *  deferred until later). Absent: only a read card counts as put away. */
+  isSetAside?: (itemKey: string) => boolean;
   /** A resolved item's card leaves Needs you: the heartbeat marks it read. */
   markNotificationRead: (id: string) => void;
   loadState: () => WorkReviewState;
@@ -533,7 +536,8 @@ export async function runWorkReviewTick(deps: WorkReviewDeps): Promise<WorkRevie
     const joined = c.workflows.filter((workflow) => !item.workflows?.includes(workflow));
     const left = (item.workflows ?? []).filter((workflow) => !c.workflows!.includes(workflow));
     const now = { subject: c.subject, detail: c.detail, refs: c.refs, count: c.count, workflows: c.workflows, observedAt: c.observedAt };
-    if (joined.length === 0 && (left.length === 0 || item.acknowledgedAt)) { Object.assign(item, now); continue; }
+    const putAway = Boolean(item.acknowledgedAt) || deps.isSetAside?.(item.key) === true;
+    if (joined.length === 0 && (left.length === 0 || putAway)) { Object.assign(item, now); continue; }
     const notification = buildWorkReviewNotification({ ...item, ...now }, at, 'quiet');
     try { deps.publish(notification); } catch { continue; } // the next tick tries again
     if (item.notificationId) { try { deps.markNotificationRead(item.notificationId); } catch { /* the new card stands */ } }

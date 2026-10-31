@@ -368,19 +368,24 @@ test('a deleted workflow is not named on a card, and a card the owner put away s
   assert.equal(deriveWorkReviewCandidates({ chats: [], drafts: [], runs }, DEFAULT_WORK_REVIEW_CONFIG, NOW, null)
     .find((x) => x.key === 'run_failed:cause:out_of_credit')?.count, 2, 'an unreadable list hides nothing');
 
-  // The owner put the card away; a workflow leaving updates it without bringing it back.
-  let workflowsNow: Set<string> | undefined;
-  const h = harness({ notify: 'push' });
-  const tick = (id: string, at: number, readIds?: Set<string>) => runWorkReviewTick({ ...h.deps, tickId: id, now: () => at,
-    isNotificationRead: (nid: string) => readIds?.has(nid) ?? false,
-    observe: async () => ({ observation: { chats: [], drafts: [], runs, ...(workflowsNow ? { workflowsNow } : {}) }, readFailures: 0 }) });
-  await tick('t1', NOW);
-  const card = h.published.find((n) => /An account is out of credit/.test(n.title))!;
-  assert.match(card.body ?? '', /FRAMEWORK-TEST Fixture Watch/);
-  workflowsNow = now;
-  await tick('t2', NOW + 30 * 60_000, new Set([card.id]));
-  assert.equal(h.published.filter((n) => /An account is out of credit/.test(n.title)).length, 1, 'no card comes back');
-  assert.deepEqual(h.state.items['run_failed:cause:out_of_credit']!.workflows, ['platform-review']);
+  // The owner put the card away (read it, or dismissed it in Needs you); a
+  // workflow leaving updates it without bringing it back.
+  for (const putAway of ['read', 'dismissed'] as const) {
+    let workflowsNow: Set<string> | undefined;
+    const h = harness({ notify: 'push' });
+    const tick = (id: string, at: number, readIds?: Set<string>, setAside?: Set<string>) => runWorkReviewTick({ ...h.deps, tickId: id, now: () => at,
+      isNotificationRead: (nid: string) => readIds?.has(nid) ?? false,
+      isSetAside: (key: string) => setAside?.has(key) ?? false,
+      observe: async () => ({ observation: { chats: [], drafts: [], runs, ...(workflowsNow ? { workflowsNow } : {}) }, readFailures: 0 }) });
+    await tick('t1', NOW);
+    const card = h.published.find((n) => /An account is out of credit/.test(n.title))!;
+    assert.match(card.body ?? '', /FRAMEWORK-TEST Fixture Watch/);
+    workflowsNow = now;
+    await tick('t2', NOW + 30 * 60_000, putAway === 'read' ? new Set([card.id]) : undefined,
+      putAway === 'dismissed' ? new Set(['run_failed:cause:out_of_credit']) : undefined);
+    assert.equal(h.published.filter((n) => /An account is out of credit/.test(n.title)).length, 1, `no card comes back (${putAway})`);
+    assert.deepEqual(h.state.items['run_failed:cause:out_of_credit']!.workflows, ['platform-review']);
+  }
 });
 
 test('a cause that stopped workflows before the review last looked keeps nothing new open', async () => {

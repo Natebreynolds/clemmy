@@ -14,6 +14,7 @@ import { withDaemonRuntimePhase } from '../daemon/phase.js';
 import { WORKFLOW_RUNS_DIR } from '../tools/shared.js';
 import { readWorkflowRunInventoryFile } from '../execution/workflow-run-inventory.js';
 import { listWorkflows } from '../memory/workflow-store.js';
+import { readAttentionPreferences } from '../dashboard/attention-presentation.js';
 import { listRuns } from '../runtime/run-events.js';
 import { addNotification, getNotification, markNotificationRead } from '../runtime/notifications.js';
 import { tryJevHeartbeatItemVerdict } from '../runtime/jev/control-plane.js';
@@ -212,6 +213,11 @@ export function runWorkReviewTickNow(options: { source: string } = { source: 'he
     judge: judgeWorkReviewCandidate,
     publish: addNotification,
     isNotificationRead: (id) => getNotification(id)?.read === true,
+    // Needs you keys a heartbeat's card as heartbeat:<id>:<item key> (needs-you.ts).
+    isSetAside: (itemKey) => {
+      const saved = readAttentionPreferences()[`heartbeat:${WORK_REVIEW_ID}:${itemKey}`];
+      return saved?.action === 'dismiss' || (saved?.action === 'defer' && Date.parse(saved.until ?? '') > Date.now());
+    },
     markNotificationRead: (id) => { markNotificationRead(id); },
     loadState: loadWorkReviewState,
     saveState: saveWorkReviewState,
