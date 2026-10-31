@@ -13,6 +13,7 @@ import { isDirectionSeekingQuestion } from './objective-judge.js';
 import { autonomousSendConsentPresentation } from './autonomous-send-consent.js';
 import { approvalCallPreview } from './approval-call-preview.js';
 import { approvalPreviewProjection } from './public-presentation.js';
+import { describeExternalWriteEvent } from './external-write-event-projection.js';
 
 export interface QueuedApprovalTransition {
   eventSeq: number;
@@ -223,6 +224,57 @@ export function queuedApprovalTransitionsForRequest(
  * full continuation and works identically on every brain. The card is parked,
  * so approving it re-drives the chat and executes only the stored payload.
  */
+function parsedRecord(value: unknown): Record<string, unknown> | null {
+  let current = value;
+  if (typeof current === 'string') {
+    try { current = JSON.parse(current) as unknown; } catch { return null; }
+  }
+  return current && typeof current === 'object' && !Array.isArray(current) ? current as Record<string, unknown> : null;
+}
+
+/** The provider call a card would run, with a carrier (name + args_json or
+ *  args) peeled to the call it carries; a queued action is already bare. */
+function innerCall(toolName: string, args: unknown): { toolName: string; args: Record<string, unknown> } | null {
+  const record = parsedRecord(args);
+  if (!record) return null;
+  if (typeof record.name === 'string' && ('args_json' in record || 'args' in record)) {
+    const inner = parsedRecord(record.args_json ?? record.args);
+    return inner ? { toolName: record.name, args: inner } : null;
+  }
+  return { toolName, args: record };
+}
+
+/**
+ * ONE CONSENT FOR ONE ACTION. A direct call parked on a card in the same
+ * request, for the identical write (same operation and arguments, so the same
+ * target and effect, on the same account), already asks the owner for it. A
+ * second card asks twice and gives one action two settlement owners (live
+ * 2026-10-31: the queued twin failed "nested-owned logical settlement is
+ * missing" while the parked call deleted the file). A different target,
+ * account or effect keeps its own card, and an account either side cannot
+ * name is never assumed equal.
+ */
+function identicalParkedApproval(sessionId: string, sourceUserSeq: number, record: { toolName: string; payload: unknown }): string | null {
+  const queued = innerCall(record.toolName, record.payload);
+  const account = typeof queued?.args.connected_account_id === 'string' ? queued.args.connected_account_id : '';
+  const fingerprint = queued ? describeExternalWriteEvent({ toolName: queued.toolName, args: queued.args, forceMutating: true })?.semanticFingerprint : undefined;
+  if (!queued || !account || !fingerprint) return null;
+  for (const event of listEvents(sessionId, { types: ['approval_requested'] })) {
+    const data = event.data;
+    if (data.sourceUserSeq !== sourceUserSeq || typeof data.approvalId !== 'string' || pendingActionIdFromArgs(data)) continue;
+    const row = approvalRegistry.get(data.approvalId);
+    if (!row || row.status !== 'pending' || approvalRegistry.isApprovalGroup(row)) continue;
+    const consent = data.consentCall && typeof data.consentCall === 'object' ? data.consentCall as Record<string, unknown> : null;
+    const parked = row.tool ? innerCall(row.tool, row.args) : null;
+    const parkedAccount = typeof consent?.accountId === 'string' ? consent.accountId
+      : typeof parked?.args.connected_account_id === 'string' ? parked.args.connected_account_id : '';
+    if (!parked || parkedAccount !== account) continue;
+    const parkedFingerprint = describeExternalWriteEvent({ toolName: parked.toolName, args: parked.args, forceMutating: true })?.semanticFingerprint;
+    if (parkedFingerprint === fingerprint) return data.approvalId;
+  }
+  return null;
+}
+
 function materializeQueuedApproval(
   sessionId: string,
   turn: number,
@@ -240,6 +292,14 @@ function materializeQueuedApproval(
       || (!queued && !linked)
       || record.payloadHash !== transition.record.payloadHash
     ) return null;
+    if (queued) {
+      const covering = identicalParkedApproval(sessionId, sourceUserSeq, record);
+      if (covering) {
+        cancelPendingActionIfQueuedUnlinked(record.id, covering,
+          `Deduplicated: the identical call already awaits the owner's approval as ${covering}.`);
+        return null;
+      }
+    }
     if (linked && record.approvalId) {
       const existingSurfaceEvents = listEvents(sessionId, {
         types: ['approval_requested', 'approval_parked'],
