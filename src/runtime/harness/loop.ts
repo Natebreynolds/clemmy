@@ -15096,10 +15096,14 @@ async function runConversationFromResumeCore(opts: {
     firstResult = await modelCheckInForExhaustedTurn(firstResult, {
       sessionId: opts.sessionId,
       sourceUserSeq: resumedSourceUserSeq,
+      // Her words about the stop are a model step of the parked business
+      // request, like every resumed step: the synthetic approval answer is
+      // never a model authority (live 2026-10-31: the check-in under it was
+      // refused as accepted_source_missing and the host sentence stood).
       run: (steer) => runTurn({
         agent: opts.agent, sessionId: opts.sessionId,
-        input: acceptedRequestText(opts.sessionId, resumedSourceUserSeq) ?? '',
-        sourceUserSeq: resumedSourceUserSeq, runAttemptId: opts.runAttemptId,
+        input: acceptedRequestText(opts.sessionId, continuationSourceUserSeq) ?? '',
+        sourceUserSeq: continuationSourceUserSeq, runAttemptId: opts.runAttemptId,
         internalContinuation: true, suppressMemoryCapture: true,
         continuationSteer: steer, hostOwnedContinuation: true as const,
         maxTurns: 1, toolCallsPerTurn: 1, hostConversationalCheckIn: true as const,
